@@ -2711,5 +2711,5 @@ CONFIG_GATOR_WITH_MALI_SUPPORT=y
 CONFIG_GATOR_MALI_4XXMP=y
 # CONFIG_GATOR_MALI_MIDGARD is not set
 # gator source needs to #include "linux/mali_linux_trace.h"
-CONFIG_GATOR_MALI_PATH="mediatek/platform/mt6582/kernel/drivers/gpu/mali/mali"
+CONFIG_GATOR_MALI_4XXMP_PATH="mediatek/platform/mt6582/kernel/drivers/gpu/mali/mali"
 CONFIG_GATOR_DRIVER=y

@@ -1,5 +1,5 @@
 /**
- * Copyright (C) ARM Limited 2010-2015. All rights reserved.
+ * Copyright (C) ARM Limited 2010-2016. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -118,6 +118,9 @@ static void arm_backtrace_eabi(int cpu, struct pt_regs *const regs, unsigned int
 }
 
 #if defined(__arm__) || defined(__aarch64__)
+
+#include <asm/stacktrace.h>
+
 static int report_trace(struct stackframe *frame, void *d)
 {
 	unsigned int *depth = d, cookie = NO_COOKIE;
@@ -130,7 +133,12 @@ static int report_trace(struct stackframe *frame, void *d)
 
 		if (mod) {
 			cookie = get_cookie(cpu, current, mod->name, false);
-			addr = addr - (unsigned long)mod->module_core;
+			addr = addr -
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0)
+			  (unsigned long)mod->module_core;
+#else
+			  (unsigned long)mod->core_layout.base;
+#endif
 		}
 #endif
 		marshal_backtrace(addr & ~1, cookie, 1);
@@ -173,7 +181,11 @@ static void kernel_backtrace(int cpu, struct pt_regs *const regs)
 	frame.sp = regs->sp;
 	frame.pc = regs->pc;
 #endif
+#if defined(__aarch64__) && LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
+	walk_stackframe(current, &frame, report_trace, &depth);
+#else
 	walk_stackframe(&frame, report_trace, &depth);
+#endif
 #else
 	marshal_backtrace(PC_REG & ~1, NO_COOKIE, 1);
 #endif

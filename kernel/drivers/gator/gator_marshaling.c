@@ -1,5 +1,5 @@
 /**
- * Copyright (C) ARM Limited 2012-2015. All rights reserved.
+ * Copyright (C) ARM Limited 2012-2016. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -27,6 +27,7 @@ static void marshal_summary(long long timestamp, long long uptime, long long mon
 {
 	unsigned long flags;
 	int cpu = 0;
+	char buf[32];
 
 	local_irq_save(flags);
 	gator_buffer_write_packed_int(cpu, SUMMARY_BUF, MESSAGE_SUMMARY);
@@ -36,6 +37,9 @@ static void marshal_summary(long long timestamp, long long uptime, long long mon
 	gator_buffer_write_packed_int64(cpu, SUMMARY_BUF, monotonic_delta);
 	gator_buffer_write_string(cpu, SUMMARY_BUF, "uname");
 	gator_buffer_write_string(cpu, SUMMARY_BUF, uname);
+	gator_buffer_write_string(cpu, SUMMARY_BUF, "PAGESIZE");
+	snprintf(buf, sizeof(buf), "%lu", PAGE_SIZE);
+	gator_buffer_write_string(cpu, SUMMARY_BUF, buf);
 #if GATOR_IKS_SUPPORT
 	gator_buffer_write_string(cpu, SUMMARY_BUF, "iks");
 	gator_buffer_write_string(cpu, SUMMARY_BUF, "");
@@ -58,6 +62,10 @@ static void marshal_summary(long long timestamp, long long uptime, long long mon
 #else
 	gator_buffer_write_string(cpu, SUMMARY_BUF, "unknown");
 #endif
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
+	gator_buffer_write_string(cpu, SUMMARY_BUF, "nosync");
+	gator_buffer_write_string(cpu, SUMMARY_BUF, "");
 #endif
 	gator_buffer_write_string(cpu, SUMMARY_BUF, "");
 	/* Commit the buffer now so it can be one of the first frames read by Streamline */

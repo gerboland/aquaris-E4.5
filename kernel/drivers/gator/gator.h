@@ -1,5 +1,5 @@
 /**
- * Copyright (C) ARM Limited 2010-2015. All rights reserved.
+ * Copyright (C) ARM Limited 2010-2016. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -14,53 +14,39 @@
 #include <linux/mm.h>
 #include <linux/list.h>
 
-#define GATOR_PERF_SUPPORT      (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0))
-#define GATOR_PERF_PMU_SUPPORT  (GATOR_PERF_SUPPORT && defined(CONFIG_PERF_EVENTS) && (!(defined(__arm__) || defined(__aarch64__)) || defined(CONFIG_HW_PERF_EVENTS)))
-#define GATOR_NO_PERF_SUPPORT   (!(GATOR_PERF_SUPPORT))
-#define GATOR_CPU_FREQ_SUPPORT  ((LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 38)) && defined(CONFIG_CPU_FREQ))
+#define GATOR_PERF_PMU_SUPPORT  (defined(CONFIG_PERF_EVENTS) && (!(defined(__arm__) || defined(__aarch64__)) || defined(CONFIG_HW_PERF_EVENTS)))
+#define GATOR_CPU_FREQ_SUPPORT  defined(CONFIG_CPU_FREQ)
 #define GATOR_IKS_SUPPORT       defined(CONFIG_BL_SWITCHER)
 
 /* cpu ids */
-#define ARM1136      0x41b36
-#define ARM1156      0x41b56
-#define ARM1176      0x41b76
-#define ARM11MPCORE  0x41b02
 #define CORTEX_A5    0x41c05
-#define CORTEX_A7    0x41c07
-#define CORTEX_A8    0x41c08
 #define CORTEX_A9    0x41c09
-#define CORTEX_A15   0x41c0f
-#define CORTEX_A12   0x41c0d
-#define CORTEX_A17   0x41c0e
-#define SCORPION     0x5100f
-#define SCORPIONMP   0x5102d
-#define KRAITSIM     0x51049
-#define KRAIT        0x5104d
-#define KRAIT_S4_PRO 0x5106f
-#define CORTEX_A53   0x41d03
-#define CORTEX_A57   0x41d07
-#define CORTEX_A72   0x41d08
 #define OTHER        0xfffff
-
-/* gpu enums */
-#define MALI_4xx     1
-#define MALI_MIDGARD 2
 
 #define MAXSIZE_CORE_NAME 32
 
 struct gator_cpu {
-	const int cpuid;
+	struct list_head list;
+	unsigned long cpuid;
+	unsigned long pmnc_counters;
 	/* Human readable name */
-	const char core_name[MAXSIZE_CORE_NAME];
+	char core_name[MAXSIZE_CORE_NAME];
 	/* gatorfs event and Perf PMU name */
-	const char *const pmnc_name;
+	char pmnc_name[MAXSIZE_CORE_NAME];
 	/* compatible from Documentation/devicetree/bindings/arm/cpus.txt */
-	const char *const dt_name;
-	const int pmnc_counters;
+	char dt_name[MAXSIZE_CORE_NAME];
 };
 
-const struct gator_cpu *gator_find_cpu_by_cpuid(const u32 cpuid);
-const struct gator_cpu *gator_find_cpu_by_pmu_name(const char *const name);
+/* clusters */
+#define GATOR_CLUSTER_COUNT 4
+
+extern const struct gator_cpu *gator_clusters[GATOR_CLUSTER_COUNT];
+extern int gator_clusterids[NR_CPUS];
+extern int gator_cluster_count;
+
+/* gpu enums */
+#define MALI_4xx     1
+#define MALI_MIDGARD 2
 
 /******************************************************************************
  * Filesystem
@@ -77,15 +63,8 @@ int gatorfs_create_ro_ulong(struct super_block *sb, struct dentry *root,
 /******************************************************************************
  * Tracepoints
  ******************************************************************************/
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 32)
-#	error Kernels prior to 2.6.32 not supported
-#elif LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35)
-#	define GATOR_DEFINE_PROBE(probe_name, proto) \
-		static void probe_##probe_name(PARAMS(proto))
-#	define GATOR_REGISTER_TRACE(probe_name) \
-		register_trace_##probe_name(probe_##probe_name)
-#	define GATOR_UNREGISTER_TRACE(probe_name) \
-		unregister_trace_##probe_name(probe_##probe_name)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
+#	error Kernels prior to 3.4 not supported. DS-5 v5.21 and earlier supported 2.6.32 and later.
 #elif LINUX_VERSION_CODE < KERNEL_VERSION(3, 15, 0)
 #	define GATOR_DEFINE_PROBE(probe_name, proto) \
 		static void probe_##probe_name(void *data, PARAMS(proto))
@@ -107,6 +86,7 @@ int gatorfs_create_ro_ulong(struct super_block *sb, struct dentry *root,
  * Events
  ******************************************************************************/
 struct gator_interface {
+	const char *const name;
 	/* Complementary function to init */
 	void (*shutdown)(void);
 	int (*create_files)(struct super_block *sb, struct dentry *root);
@@ -120,16 +100,15 @@ struct gator_interface {
 	/* called in process context but may not be running on core 'cpu' */
 	void (*offline_dispatch)(int cpu, bool migrate);
 	int (*read)(int **buffer, bool sched_switch);
-	int (*read64)(long long **buffer);
+	int (*read64)(long long **buffer, bool sched_switch);
 	int (*read_proc)(long long **buffer, struct task_struct *);
 	struct list_head list;
 };
 
+u64 gator_get_time(void);
 int gator_events_install(struct gator_interface *interface);
 int gator_events_get_key(void);
 u32 gator_cpuid(void);
-
-void gator_backtrace_handler(struct pt_regs *const regs);
 
 void gator_marshal_activity_switch(int core, int key, int activity, int pid);
 

@@ -1,5 +1,5 @@
 /**
- * Copyright (C) ARM Limited 2010-2015. All rights reserved.
+ * Copyright (C) ARM Limited 2010-2016. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -8,7 +8,7 @@
  */
 
 /* This version must match the gator daemon version */
-#define PROTOCOL_VERSION 21
+#define PROTOCOL_VERSION 240
 static unsigned long gator_protocol_version = PROTOCOL_VERSION;
 
 #include <linux/slab.h>
@@ -24,14 +24,13 @@ static unsigned long gator_protocol_version = PROTOCOL_VERSION;
 #include <linux/perf_event.h>
 #include <linux/utsname.h>
 #include <linux/kthread.h>
-#include <asm/stacktrace.h>
 #include <linux/uaccess.h>
 
 #include "gator.h"
 #include "gator_src_md5.h"
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 32)
-#error kernels prior to 2.6.32 are not supported
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
+#error Kernels prior to 3.4 not supported. DS-5 v5.21 and earlier supported 2.6.32 and later.
 #endif
 
 #if defined(MODULE) && !defined(CONFIG_MODULES)
@@ -54,7 +53,7 @@ static unsigned long gator_protocol_version = PROTOCOL_VERSION;
 #error gator requires the kernel to have CONFIG_LOCAL_TIMERS defined on SMP systems
 #endif
 
-#if (GATOR_PERF_SUPPORT) && (!(GATOR_PERF_PMU_SUPPORT))
+#if !(GATOR_PERF_PMU_SUPPORT)
 #ifndef CONFIG_PERF_EVENTS
 #error gator requires the kernel to have CONFIG_PERF_EVENTS defined to support pmu hardware counters
 #elif !defined CONFIG_HW_PERF_EVENTS
@@ -153,18 +152,14 @@ static unsigned long gator_response_type;
 static DEFINE_MUTEX(start_mutex);
 static DEFINE_MUTEX(gator_buffer_mutex);
 
-bool event_based_sampling;
+static bool event_based_sampling;
 
 static DECLARE_WAIT_QUEUE_HEAD(gator_buffer_wait);
 static DECLARE_WAIT_QUEUE_HEAD(gator_annotate_wait);
 static struct timer_list gator_buffer_wake_up_timer;
 static bool gator_buffer_wake_run;
 /* Initialize semaphore unlocked to initialize memory values */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 36)
-static DECLARE_MUTEX(gator_buffer_wake_sem);
-#else
 static DEFINE_SEMAPHORE(gator_buffer_wake_sem);
-#endif
 static struct task_struct *gator_buffer_wake_thread;
 static LIST_HEAD(gator_events);
 
@@ -173,6 +168,7 @@ static DEFINE_PER_CPU(u64, last_timestamp);
 static bool printed_monotonic_warning;
 
 static u32 gator_cpuids[NR_CPUS];
+int gator_clusterids[NR_CPUS];
 static bool sent_core_name[NR_CPUS];
 
 static DEFINE_PER_CPU(bool, in_scheduler_context);
@@ -180,9 +176,15 @@ static DEFINE_PER_CPU(bool, in_scheduler_context);
 /******************************************************************************
  * Prototypes
  ******************************************************************************/
-static u64 gator_get_time(void);
 static void gator_emit_perf_time(u64 time);
 static void gator_op_create_files(struct super_block *sb, struct dentry *root);
+static void gator_backtrace_handler(struct pt_regs *const regs);
+static int gator_events_perf_pmu_reread(void);
+static int gator_events_perf_pmu_create_files(struct super_block *sb, struct dentry *root);
+static void gator_trace_power_init(void);
+static int gator_trace_power_create_files(struct super_block *sb, struct dentry *root);
+static int sched_trace_create_files(struct super_block *sb, struct dentry *root);
+static void gator_trace_sched_init(void);
 
 /* gator_buffer is protected by being per_cpu and by having IRQs
  * disabled when writing to it. Most marshal_* calls take care of this
@@ -219,8 +221,6 @@ static DEFINE_PER_CPU(u64, gator_buffer_commit_time);
 
 /* List of all gator events - new events must be added to this list */
 #define GATOR_EVENTS_LIST \
-	GATOR_EVENT(gator_events_armv6_init) \
-	GATOR_EVENT(gator_events_armv7_init) \
 	GATOR_EVENT(gator_events_block_init) \
 	GATOR_EVENT(gator_events_ccn504_init) \
 	GATOR_EVENT(gator_events_irq_init) \
@@ -233,7 +233,6 @@ static DEFINE_PER_CPU(u64, gator_buffer_commit_time);
 	GATOR_EVENT(gator_events_net_init) \
 	GATOR_EVENT(gator_events_perf_pmu_init) \
 	GATOR_EVENT(gator_events_sched_init) \
-	GATOR_EVENT(gator_events_scorpion_init) \
 
 #define GATOR_EVENT(EVENT_INIT) __weak int EVENT_INIT(void);
 GATOR_EVENTS_LIST
@@ -249,6 +248,7 @@ GATOR_EVENTS_LIST
  * Application Includes
  ******************************************************************************/
 #include "gator_fs.c"
+#include "gator_pmu.c"
 #include "gator_buffer_write.c"
 #include "gator_buffer.c"
 #include "gator_marshaling.c"
@@ -259,6 +259,7 @@ GATOR_EVENTS_LIST
 #include "gator_trace_power.c"
 #include "gator_trace_gpu.c"
 #include "gator_backtrace.c"
+#include "gator_events_perf_pmu.c"
 
 /******************************************************************************
  * Misc
@@ -266,181 +267,6 @@ GATOR_EVENTS_LIST
 
 MODULE_PARM_DESC(gator_src_md5, "Gator driver source code md5sum");
 module_param_named(src_md5, gator_src_md5, charp, 0444);
-
-static const struct gator_cpu gator_cpus[] = {
-	{
-		.cpuid = ARM1136,
-		.core_name = "ARM1136",
-		.pmnc_name = "ARM_ARM11",
-		.dt_name = "arm,arm1136",
-		.pmnc_counters = 3,
-	},
-	{
-		.cpuid = ARM1156,
-		.core_name = "ARM1156",
-		.pmnc_name = "ARM_ARM11",
-		.dt_name = "arm,arm1156",
-		.pmnc_counters = 3,
-	},
-	{
-		.cpuid = ARM1176,
-		.core_name = "ARM1176",
-		.pmnc_name = "ARM_ARM11",
-		.dt_name = "arm,arm1176",
-		.pmnc_counters = 3,
-	},
-	{
-		.cpuid = ARM11MPCORE,
-		.core_name = "ARM11MPCore",
-		.pmnc_name = "ARM_ARM11MPCore",
-		.dt_name = "arm,arm11mpcore",
-		.pmnc_counters = 3,
-	},
-	{
-		.cpuid = CORTEX_A5,
-		.core_name = "Cortex-A5",
-		.pmnc_name = "ARMv7_Cortex_A5",
-		.dt_name = "arm,cortex-a5",
-		.pmnc_counters = 2,
-	},
-	{
-		.cpuid = CORTEX_A7,
-		.core_name = "Cortex-A7",
-		.pmnc_name = "ARMv7_Cortex_A7",
-		.dt_name = "arm,cortex-a7",
-		.pmnc_counters = 4,
-	},
-	{
-		.cpuid = CORTEX_A8,
-		.core_name = "Cortex-A8",
-		.pmnc_name = "ARMv7_Cortex_A8",
-		.dt_name = "arm,cortex-a8",
-		.pmnc_counters = 4,
-	},
-	{
-		.cpuid = CORTEX_A9,
-		.core_name = "Cortex-A9",
-		.pmnc_name = "ARMv7_Cortex_A9",
-		.dt_name = "arm,cortex-a9",
-		.pmnc_counters = 6,
-	},
-	{
-		.cpuid = CORTEX_A15,
-		.core_name = "Cortex-A15",
-		.pmnc_name = "ARMv7_Cortex_A15",
-		.dt_name = "arm,cortex-a15",
-		.pmnc_counters = 6,
-	},
-	{
-		.cpuid = CORTEX_A12,
-		.core_name = "Cortex-A17",
-		.pmnc_name = "ARMv7_Cortex_A17",
-		.dt_name = "arm,cortex-a17",
-		.pmnc_counters = 6,
-	},
-	{
-		.cpuid = CORTEX_A17,
-		.core_name = "Cortex-A17",
-		.pmnc_name = "ARMv7_Cortex_A17",
-		.dt_name = "arm,cortex-a17",
-		.pmnc_counters = 6,
-	},
-	{
-		.cpuid = SCORPION,
-		.core_name = "Scorpion",
-		.pmnc_name = "Scorpion",
-		.pmnc_counters = 4,
-	},
-	{
-		.cpuid = SCORPIONMP,
-		.core_name = "ScorpionMP",
-		.pmnc_name = "ScorpionMP",
-		.pmnc_counters = 4,
-	},
-	{
-		.cpuid = KRAITSIM,
-		.core_name = "KraitSIM",
-		.pmnc_name = "Krait",
-		.pmnc_counters = 4,
-	},
-	{
-		.cpuid = KRAIT,
-		.core_name = "Krait",
-		.pmnc_name = "Krait",
-		.pmnc_counters = 4,
-	},
-	{
-		.cpuid = KRAIT_S4_PRO,
-		.core_name = "Krait S4 Pro",
-		.pmnc_name = "Krait",
-		.pmnc_counters = 4,
-	},
-	{
-		.cpuid = CORTEX_A53,
-		.core_name = "Cortex-A53",
-		.pmnc_name = "ARM_Cortex-A53",
-		.dt_name = "arm,cortex-a53",
-		.pmnc_counters = 6,
-	},
-	{
-		.cpuid = CORTEX_A57,
-		.core_name = "Cortex-A57",
-		.pmnc_name = "ARM_Cortex-A57",
-		.dt_name = "arm,cortex-a57",
-		.pmnc_counters = 6,
-	},
-	{
-		.cpuid = CORTEX_A72,
-		.core_name = "Cortex-A72",
-		.pmnc_name = "ARM_Cortex-A72",
-		.dt_name = "arm,cortex-a72",
-		.pmnc_counters = 6,
-	},
-	{
-		.cpuid = OTHER,
-		.core_name = "Other",
-		.pmnc_name = "Other",
-		.pmnc_counters = 6,
-	},
-	{}
-};
-
-const struct gator_cpu *gator_find_cpu_by_cpuid(const u32 cpuid)
-{
-	int i;
-
-	for (i = 0; gator_cpus[i].cpuid != 0; ++i) {
-		const struct gator_cpu *const gator_cpu = &gator_cpus[i];
-
-		if (gator_cpu->cpuid == cpuid)
-			return gator_cpu;
-	}
-
-	return NULL;
-}
-
-static const char OLD_PMU_PREFIX[] = "ARMv7 Cortex-";
-static const char NEW_PMU_PREFIX[] = "ARMv7_Cortex_";
-
-const struct gator_cpu *gator_find_cpu_by_pmu_name(const char *const name)
-{
-	int i;
-
-	for (i = 0; gator_cpus[i].cpuid != 0; ++i) {
-		const struct gator_cpu *const gator_cpu = &gator_cpus[i];
-
-		if (gator_cpu->pmnc_name != NULL &&
-		    /* Do the names match exactly? */
-		    (strcasecmp(gator_cpu->pmnc_name, name) == 0 ||
-		     /* Do these names match but have the old vs new prefix? */
-		     ((strncasecmp(name, OLD_PMU_PREFIX, sizeof(OLD_PMU_PREFIX) - 1) == 0 &&
-		       strncasecmp(gator_cpu->pmnc_name, NEW_PMU_PREFIX, sizeof(NEW_PMU_PREFIX) - 1) == 0 &&
-		       strcasecmp(name + sizeof(OLD_PMU_PREFIX) - 1, gator_cpu->pmnc_name + sizeof(NEW_PMU_PREFIX) - 1) == 0))))
-			return gator_cpu;
-	}
-
-	return NULL;
-}
 
 u32 gator_cpuid(void)
 {
@@ -511,7 +337,7 @@ static void gator_timer_interrupt(void)
 	gator_backtrace_handler(regs);
 }
 
-void gator_backtrace_handler(struct pt_regs *const regs)
+static void gator_backtrace_handler(struct pt_regs *const regs)
 {
 	u64 time = gator_get_time();
 	int cpu = get_physical_cpu();
@@ -551,6 +377,8 @@ static void gator_timer_offline(void *migrate)
 		list_for_each_entry(gi, &gator_events, list) {
 			if (gi->offline) {
 				len = gi->offline(&buffer, migrate);
+				if (len < 0)
+					pr_err("gator: offline failed for %s\n", gi->name);
 				marshal_event(len, buffer);
 			}
 		}
@@ -589,6 +417,18 @@ static void gator_timer_stop(void)
 	}
 }
 
+static int gator_get_clusterid(const u32 cpuid)
+{
+	int i;
+
+	for (i = 0; i < gator_cluster_count; i++) {
+		if (gator_clusters[i]->cpuid == cpuid)
+			return i;
+	}
+
+	return 0;
+}
+
 static void gator_send_core_name(const int cpu, const u32 cpuid)
 {
 #if defined(__arm__) || defined(__aarch64__)
@@ -599,6 +439,7 @@ static void gator_send_core_name(const int cpu, const u32 cpuid)
 
 		/* Save off this cpuid */
 		gator_cpuids[cpu] = cpuid;
+		gator_clusterids[cpu] = gator_get_clusterid(cpuid);
 		if (gator_cpu != NULL) {
 			core_name = gator_cpu->core_name;
 		} else {
@@ -617,7 +458,11 @@ static void gator_send_core_name(const int cpu, const u32 cpuid)
 
 static void gator_read_cpuid(void *arg)
 {
-	gator_cpuids[get_physical_cpu()] = gator_cpuid();
+	const u32 cpuid = gator_cpuid();
+	const int cpu = get_physical_cpu();
+
+	gator_cpuids[cpu] = cpuid;
+	gator_clusterids[cpu] = gator_get_clusterid(cpuid);
 }
 
 /* This function runs in interrupt context and on the appropriate core */
@@ -639,6 +484,8 @@ static void gator_timer_online(void *migrate)
 		list_for_each_entry(gi, &gator_events, list) {
 			if (gi->online) {
 				len = gi->online(&buffer, migrate);
+				if (len < 0)
+					pr_err("gator: online failed for %s\n", gi->name);
 				marshal_event(len, buffer);
 			}
 		}
@@ -699,7 +546,7 @@ static int gator_timer_start(unsigned long sample_rate)
 	return 0;
 }
 
-static u64 gator_get_time(void)
+u64 gator_get_time(void)
 {
 	struct timespec ts;
 	u64 timestamp;
@@ -735,13 +582,12 @@ static u64 gator_get_time(void)
 
 static void gator_emit_perf_time(u64 time)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0) && LINUX_VERSION_CODE < KERNEL_VERSION(4, 2, 0)
 	if (time >= gator_sync_time) {
 		marshal_event_single64(0, -1, local_clock());
 		gator_sync_time += NSEC_PER_SEC;
-		if (gator_live_rate <= 0) {
+		if (gator_live_rate <= 0)
 			gator_commit_buffer(get_physical_cpu(), COUNTER_BUF, time);
-		}
 	}
 #endif
 }
@@ -749,7 +595,7 @@ static void gator_emit_perf_time(u64 time)
 /******************************************************************************
  * cpu hotplug and pm notifiers
  ******************************************************************************/
-static int __cpuinit gator_hotcpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
+static int gator_hotcpu_notify(struct notifier_block *self, unsigned long action, void *hcpu)
 {
 	int cpu = lcpu_to_pcpu((long)hcpu);
 
@@ -844,7 +690,7 @@ static void gator_summary(void)
 {
 	u64 timestamp, uptime;
 	struct timespec ts;
-	char uname_buf[512];
+	char uname_buf[100];
 
 	snprintf(uname_buf, sizeof(uname_buf), "%s %s %s %s %s GNU/Linux", utsname()->sysname, utsname()->nodename, utsname()->release, utsname()->version, utsname()->machine);
 
@@ -904,17 +750,7 @@ int gator_events_get_key(void)
 
 static int gator_init(void)
 {
-	int i;
-
 	calc_first_cluster_size();
-
-	/* events sources */
-	for (i = 0; i < ARRAY_SIZE(gator_events_list); i++)
-		if (gator_events_list[i])
-			gator_events_list[i]();
-
-	gator_trace_sched_init();
-	gator_trace_power_init();
 
 	return 0;
 }
@@ -1364,7 +1200,6 @@ static const struct file_operations depth_fops = {
 static void gator_op_create_files(struct super_block *sb, struct dentry *root)
 {
 	struct dentry *dir;
-	struct gator_interface *gi;
 	int cpu;
 
 	/* reinitialize default values */
@@ -1387,20 +1222,11 @@ static void gator_op_create_files(struct super_block *sb, struct dentry *root)
 	gatorfs_create_ro_u64(sb, root, "started", &gator_monotonic_started);
 	gatorfs_create_u64(sb, root, "live_rate", &gator_live_rate);
 
-	/* Annotate interface */
 	gator_annotate_create_files(sb, root);
 
 	/* Linux Events */
 	dir = gatorfs_mkdir(sb, root, "events");
-	list_for_each_entry(gi, &gator_events, list)
-		if (gi->create_files)
-			gi->create_files(sb, dir);
-
-	/* Sched Events */
-	sched_trace_create_files(sb, dir);
-
-	/* Power interface */
-	gator_trace_power_create_files(sb, dir);
+	gator_pmu_create_files(sb, root, dir);
 }
 
 /******************************************************************************
@@ -1473,7 +1299,7 @@ static int __init gator_module_init(void)
 		return -1;
 	}
 
-	setup_timer(&gator_buffer_wake_up_timer, gator_buffer_wake_up, 0);
+	setup_deferrable_timer_on_stack(&gator_buffer_wake_up_timer, gator_buffer_wake_up, 0);
 
 	/* Initialize the list of cpuids */
 	memset(gator_cpuids, -1, sizeof(gator_cpuids));
@@ -1488,6 +1314,7 @@ static void __exit gator_module_exit(void)
 	tracepoint_synchronize_unregister();
 	gator_exit();
 	gatorfs_unregister();
+	gator_pmu_exit();
 }
 
 module_init(gator_module_init);
